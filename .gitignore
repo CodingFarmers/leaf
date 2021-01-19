@@ -1,3 +1,7 @@
 *.pth
 *.out
 2021*/
+
+__pycache__/
+
+*.log
