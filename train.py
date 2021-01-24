@@ -1,23 +1,3 @@
-CFG = {
-    'fold_num': 5,
-    'seed': 719,
-    'model_arch': 'tf_efficientnet_b4_ns',
-    'img_size': 456,
-    'epochs': 10,
-    'train_bs': 32,
-    'valid_bs': 32,
-    'T_0': 10,
-    'lr': 1e-4,
-    'min_lr': 1e-6,
-    'weight_decay':1e-6,
-    't1': 1.0,
-    't2': 1.0,
-    'label_smoothing': 0.2,
-    'num_workers': 4,
-    'accum_iter': 1, # suppoprt to do batch accumulation for backprop with effectively larger batch size
-    'verbose_step': 1,
-    'device': 'cuda:2'
-}
 from glob import glob
 from sklearn.model_selection import GroupKFold, StratifiedKFold
 import cv2
@@ -55,39 +35,44 @@ import pydicom
 #from efficientnet_pytorch import EfficientNet
 from scipy.ndimage.interpolation import zoom
 import fitlog
+from vision_transformer_pytorch import VisionTransformer
 from loss import BiTemperedLoss
 import datetime
 import argparse
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--random-search', type=bool, default=False)
+parser.add_argument('--seed', type=int, default=719)
+parser.add_argument('--img-size', type=int, default=384)
+parser.add_argument('--model', type=str, default='tf_efficientnet_b4_ns')
 parser.add_argument('--nfold', type=int, default=1)
-parser.add_argument('--gpu', type=int, default=0)
-parser.add_argument('--lr', type=float, default=0.0013182567385564075)
+parser.add_argument('--lr', type=float, default=1e-4)
+parser.add_argument('--min_lr', type=float, default=1e-6)
+parser.add_argument('--t0', type=int, default=10)
 parser.add_argument('--momentum', type=float, default=0.9)
 parser.add_argument('--weight-decay', type=float, default=1e-6)
 parser.add_argument('--batch-size', type=int, default=32)
+parser.add_argument('--accum_iter', type=int, default=1)
 parser.add_argument('--epochs', type=int, default=10)
 
+parser.add_argument('--random-search', type=bool, default=False)
+parser.add_argument('--verbose', type=int, default=1)
 # bitempered loss
 parser.add_argument('--t1', type=float, default=1.)
 parser.add_argument('--t2', type=float, default=1.)
-parser.add_argument('--smooth-ratio', type=float, default=0.1)
+parser.add_argument('--smooth-ratio', type=float, default=0.0)
+parser.add_argument('--gpu', type=str, default='0')
 args = parser.parse_args()
 
 
-if args.random_search:
-    CFG['device'] = 'cuda:' + str(args.gpu)
-    CFG['t1'] = args.t1
-    CFG['t2'] = args.t2
-    CFG['label_smoothing'] = args.smooth-ratio
+os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
 min_loss = 1e10
 max_acc = 0.
 
-fitlog.set_log_dir('logs/')
-fitlog.add_hyper(CFG)
+save_dir = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')
+fitlog.set_log_dir('logs/', save_dir)
+fitlog.add_hyper(args)
 
 train = pd.read_csv('../cassava/cassava-leaf-disease-classification/origin_train.csv')
 submission = pd.read_csv('../cassava/cassava-leaf-disease-classification/sample_submission.csv')
@@ -137,7 +122,7 @@ from albumentations.pytorch import ToTensorV2
 
 def get_train_transforms():
     return Compose([
-            RandomResizedCrop(CFG['img_size'], CFG['img_size']),
+            RandomResizedCrop(args.img_size, args.img_size),
             Transpose(p=0.5),
             HorizontalFlip(p=0.5),
             VerticalFlip(p=0.5),
@@ -146,15 +131,15 @@ def get_train_transforms():
             RandomBrightnessContrast(brightness_limit=(-0.1,0.1), contrast_limit=(-0.1, 0.1), p=0.5),
             Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], max_pixel_value=255.0, p=1.0),
             CoarseDropout(p=0.5),
-            Cutout(p=0.5),
+            # Cutout(p=0.5),
             ToTensorV2(p=1.0),
         ], p=1.)
   
         
 def get_valid_transforms():
     return Compose([
-            CenterCrop(CFG['img_size'], CFG['img_size'], p=1.),
-            Resize(CFG['img_size'], CFG['img_size']),
+            # CenterCrop(args.img_size, args.img_size),
+            Resize(args.img_size, args.img_size),
             Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], max_pixel_value=255.0, p=1.0),
             ToTensorV2(p=1.0),
         ], p=1.)
@@ -172,17 +157,17 @@ def prepare_dataloader(df, trn_idx, val_idx, data_root='../input/cassava-leaf-di
     
     train_loader = torch.utils.data.DataLoader(
         train_ds,
-        batch_size=CFG['train_bs'],
+        batch_size=args.batch_size,
         pin_memory=False,
         drop_last=False,
         shuffle=True,        
-        num_workers=CFG['num_workers'],
+        num_workers=4,
         #sampler=BalanceClassSampler(labels=train_['label'].values, mode="downsampling")
     )
     val_loader = torch.utils.data.DataLoader(
         valid_ds, 
-        batch_size=CFG['valid_bs'],
-        num_workers=CFG['num_workers'],
+        batch_size=args.batch_size,
+        num_workers=4,
         shuffle=False,
         pin_memory=False,
     )
@@ -216,7 +201,7 @@ def train_one_epoch(epoch, model, loss_fn, optimizer, train_loader, device, sche
             else:
                 running_loss = running_loss * .99 + loss.item() * .01
 
-            if ((step + 1) %  CFG['accum_iter'] == 0) or ((step + 1) == len(train_loader)):
+            if ((step + 1) %  args.accum_iter == 0) or ((step + 1) == len(train_loader)):
                 # may unscale_ here if desired (e.g., to allow clipping unscaled gradients)
 
                 scaler.step(optimizer)
@@ -226,7 +211,7 @@ def train_one_epoch(epoch, model, loss_fn, optimizer, train_loader, device, sche
                 if scheduler is not None and schd_batch_update:
                     scheduler.step()
 
-            if ((step + 1) % CFG['verbose_step'] == 0) or ((step + 1) == len(train_loader)):
+            if ((step + 1) % args.verbose == 0) or ((step + 1) == len(train_loader)):
                 description = f'epoch {epoch} loss: {running_loss:.4f}'
                 
                 pbar.set_description(description)
@@ -234,7 +219,7 @@ def train_one_epoch(epoch, model, loss_fn, optimizer, train_loader, device, sche
     if scheduler is not None and not schd_batch_update:
         scheduler.step()
         
-def valid_one_epoch(epoch, model, loss_fn, val_loader, device, scheduler=None, schd_loss_update=False):
+def valid_one_epoch(fold, epoch, model, loss_fn, val_loader, device, scheduler=None, schd_loss_update=False):
     global max_acc, min_loss
 
     model.eval()
@@ -261,7 +246,7 @@ def valid_one_epoch(epoch, model, loss_fn, val_loader, device, scheduler=None, s
         loss_sum += loss.item()*image_labels.shape[0]
         sample_num += image_labels.shape[0]  
 
-        if ((step + 1) % CFG['verbose_step'] == 0) or ((step + 1) == len(val_loader)):
+        if ((step + 1) % args.verbose == 0) or ((step + 1) == len(val_loader)):
             description = f'epoch {epoch} loss: {loss_sum/sample_num:.4f}'
             pbar.set_description(description)
     
@@ -273,9 +258,12 @@ def valid_one_epoch(epoch, model, loss_fn, val_loader, device, scheduler=None, s
     if loss_sum < min_loss:
         min_loss = loss_sum
         fitlog.add_best_metric({'loss': min_loss})
+        fitlog.add_best_metric({'loss_epoch': epoch})
     if acc > max_acc:
         max_acc = acc
         fitlog.add_best_metric({'acc': max_acc})
+        fitlog.add_best_metric({'acc_epoch': epoch})
+        torch.save(model.state_dict(),'{}/{}_fold_{}_best'.format(save_dir, args.model, fold))
 
     print('validation multi-class accuracy = {:.4f}'.format((image_preds_all==image_targets_all).mean()))
     
@@ -295,7 +283,7 @@ class CassavaDataset(Dataset):
                  fmix_params={
                      'alpha': 1., 
                      'decay_power': 3., 
-                     'shape': (CFG['img_size'], CFG['img_size']),
+                     'shape': (args.img_size, args.img_size),
                      'max_soft': True, 
                      'reformulate': False
                  },
@@ -365,7 +353,7 @@ class CassavaDataset(Dataset):
                 #assert self.output_label==True and self.one_hot_label==True
 
                 # mix target
-                rate = mask.sum()/CFG['img_size']/CFG['img_size']
+                rate = mask.sum()/args.img_size/args.img_size
                 target = rate*target + (1.-rate)*self.labels[fmix_ix]
                 #print(target, mask, img)
                 #assert False
@@ -379,11 +367,11 @@ class CassavaDataset(Dataset):
                     cmix_img = self.transforms(image=cmix_img)['image']
                     
                 lam = np.clip(np.random.beta(self.cutmix_params['alpha'], self.cutmix_params['alpha']),0.3,0.4)
-                bbx1, bby1, bbx2, bby2 = rand_bbox((CFG['img_size'], CFG['img_size']), lam)
+                bbx1, bby1, bbx2, bby2 = rand_bbox((args.img_size, args.img_size), lam)
 
                 img[:, bbx1:bbx2, bby1:bby2] = cmix_img[:, bbx1:bbx2, bby1:bby2]
 
-                rate = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (CFG['img_size'] * CFG['img_size']))
+                rate = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (args.img_size * args.img_size))
                 target = rate*target + (1.-rate)*self.labels[cmix_ix]
                 
             #print('-', img.sum())
@@ -414,22 +402,21 @@ class CassvaImgClassifier(nn.Module):
     def forward(self, x):
         x = self.model(x)
         return x
+
 if __name__ == '__main__':
      # for training only, need nightly build pytorch
 
     acc = []
-    seed_everything(CFG['seed'])
+    seed_everything(args.seed)
     
-    folds = StratifiedKFold(n_splits=CFG['fold_num'], shuffle=True, random_state=CFG['seed']).split(np.arange(train.shape[0]), train.label.values)
+    folds = StratifiedKFold(n_splits=5, shuffle=True, random_state=args.seed).split(np.arange(train.shape[0]), train.label.values)
     
-    save_dir = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
     for fold, (trn_idx, val_idx) in enumerate(folds):
         # we'll train fold 0 first
-        if fold > 0:
-            pass
-            # break 
+        if fold > args.nfold - 1:
+            break 
 
 
         max_acc = 0.
@@ -439,26 +426,35 @@ if __name__ == '__main__':
         print(len(trn_idx), len(val_idx))
         train_loader, val_loader = prepare_dataloader(train, trn_idx, val_idx, data_root='../cassava/cassava-leaf-disease-classification/train_images/')
 
-        device = torch.device(CFG['device'])
+        device = torch.device('cuda:0')
         
-        model = CassvaImgClassifier(CFG['model_arch'], train.label.nunique(), pretrained=True).to(device)
+        if args.model == 'vit':
+            model = VisionTransformer.from_pretrained('ViT-B_16', num_classes=5).to(device)
+        else:
+            model = CassvaImgClassifier(args.model, train.label.nunique(), pretrained=True).to(device)
         scaler = GradScaler()   
-        optimizer = torch.optim.Adam(model.parameters(), lr=CFG['lr'], weight_decay=CFG['weight_decay'])
-        #scheduler = torch.optim.lr_scheduler.StepLR(optimizer, gamma=0.1, step_size=CFG['epochs']-1)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=CFG['T_0'], T_mult=1, eta_min=CFG['min_lr'], last_epoch=-1)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        #scheduler = torch.optim.lr_scheduler.StepLR(optimizer, gamma=0.1, step_size=args.epochs-1)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=args.t0, T_mult=1, eta_min=args.min_lr, last_epoch=-1)
         #scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer=optimizer, pct_start=0.1, div_factor=25, 
-        #                                                max_lr=CFG['lr'], epochs=CFG['epochs'], steps_per_epoch=len(train_loader))
+        #                                                max_lr=args.lr, epochs=args.epochs, steps_per_epoch=len(train_loader))
         
-        # criterion = nn.CrossEntropyLoss().to(device) 
-        criterion = BiTemperedLoss(t1=CFG['t1'], t2=CFG['t2'], label_smoothing=CFG['label_smoothing']).to(device)
-        
-        for epoch in range(CFG['epochs']):
+        if args.smooth_ratio > 0.:
+            criterion = BiTemperedLoss(t1=args.t1, t2=args.t2, label_smoothing=args.smooth_ratio).to(device)
+        else:
+            criterion = nn.CrossEntropyLoss().to(device) 
+
+        if args.model == 'vit':
+            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.001)
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.1)        
+
+        for epoch in range(args.epochs):
             train_one_epoch(epoch, model, criterion, optimizer, train_loader, device, scheduler=scheduler, schd_batch_update=False)
 
             with torch.no_grad():
-                valid_one_epoch(epoch, model, criterion, val_loader, device, scheduler=None, schd_loss_update=False)
+                valid_one_epoch(fold, epoch, model, criterion, val_loader, device, scheduler=None, schd_loss_update=False)
 
-            torch.save(model.state_dict(),'{}/{}_fold_{}_{}'.format(save_dir, CFG['model_arch'], fold, epoch))
+            torch.save(model.state_dict(),'{}/{}_fold_{}_last'.format(save_dir, args.model, fold))
             
         del model, optimizer, train_loader, val_loader, scaler, scheduler
         torch.cuda.empty_cache()
