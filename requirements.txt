@@ -1,0 +1,13 @@
+glob
+sklearn
+opencv-python
+pandas
+numpy
+tqdm
+matplotlib
+fitlog
+
+torch>=1.7
+torchvision
+timm
+albumentations

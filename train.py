@@ -26,42 +26,45 @@ import timm
 
 import sklearn
 import warnings
-import joblib
+# import joblib
 from sklearn.metrics import roc_auc_score, log_loss
 from sklearn import metrics
 import warnings
 import cv2
-import pydicom
-#from efficientnet_pytorch import EfficientNet
-from scipy.ndimage.interpolation import zoom
-import fitlog
-from vision_transformer_pytorch import VisionTransformer
+# import pydicom
+# from efficientnet_pytorch import EfficientNet
+# from scipy.ndimage.interpolation import zoom
+# import fitlog
+#from .vision_transformer_pytorch import VisionTransformer
 from loss import BiTemperedLoss
 import datetime
 import argparse
-
+from torch.optim.swa_utils import AveragedModel, SWALR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--seed', type=int, default=719)
-parser.add_argument('--img-size', type=int, default=384)
-parser.add_argument('--model', type=str, default='tf_efficientnet_b4_ns')
-parser.add_argument('--nfold', type=int, default=1)
-parser.add_argument('--lr', type=float, default=1e-4)
+parser.add_argument('--seed', type=int, default=2021)
+parser.add_argument('--img-size', type=int, default=512)
+parser.add_argument('--model', type=str, default='tf_efficientnet_b4_ns')#swsl_resnext101_32x8d tf_efficientnet_b4_ns gluon_seresnext101_64x4d 
+parser.add_argument('--nfold', type=int, default=5)
+parser.add_argument('--lr', type=float, default=1e-3)
 parser.add_argument('--min_lr', type=float, default=1e-6)
-parser.add_argument('--t0', type=int, default=10)
+parser.add_argument('--t0', type=int, default=1)
 parser.add_argument('--momentum', type=float, default=0.9)
 parser.add_argument('--weight-decay', type=float, default=1e-6)
-parser.add_argument('--batch-size', type=int, default=32)
-parser.add_argument('--accum_iter', type=int, default=1)
-parser.add_argument('--epochs', type=int, default=10)
-
+parser.add_argument('--batch-size', type=int, default=16)
+parser.add_argument('--accum_iter', type=int, default=2)
+parser.add_argument('--epochs', type=int, default=30)
 parser.add_argument('--random-search', type=bool, default=False)
 parser.add_argument('--verbose', type=int, default=1)
 # bitempered loss
 parser.add_argument('--t1', type=float, default=1.)
 parser.add_argument('--t2', type=float, default=1.)
-parser.add_argument('--smooth-ratio', type=float, default=0.0)
-parser.add_argument('--gpu', type=str, default='0')
+parser.add_argument('--smooth-ratio', type=float, default=0.2)
+parser.add_argument('--gpu', type=str, default='0,1')
+# swa
+parser.add_argument('--swa-start', type=int, default=20)
+parser.add_argument('--swa-lr', type=float, default=1e-3)
 args = parser.parse_args()
 
 
@@ -71,11 +74,11 @@ min_loss = 1e10
 max_acc = 0.
 
 save_dir = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')
-fitlog.set_log_dir('logs/', save_dir)
-fitlog.add_hyper(args)
+# fitlog.set_log_dir('logs/', save_dir)
+# fitlog.add_hyper(args)
 
-train = pd.read_csv('../cassava/cassava-leaf-disease-classification/origin_train.csv')
-submission = pd.read_csv('../cassava/cassava-leaf-disease-classification/sample_submission.csv')
+train = pd.read_csv('cassava/train.csv')
+submission = pd.read_csv('cassava/sample_submission.csv')
 def seed_everything(seed):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -145,9 +148,9 @@ def get_valid_transforms():
         ], p=1.)
 
 
-def prepare_dataloader(df, trn_idx, val_idx, data_root='../input/cassava-leaf-disease-classification/train_images/'):
+def prepare_dataloader(df, trn_idx, val_idx, data_root='cassava/train_images/'):
     
-    from catalyst.data.sampler import BalanceClassSampler
+    #from catalyst.data.sampler import BalanceClassSampler
     
     train_ = df.loc[trn_idx,:].reset_index(drop=True)
     valid_ = df.loc[val_idx,:].reset_index(drop=True)
@@ -173,7 +176,7 @@ def prepare_dataloader(df, trn_idx, val_idx, data_root='../input/cassava-leaf-di
     )
     return train_loader, val_loader
 
-def train_one_epoch(epoch, model, loss_fn, optimizer, train_loader, device, scheduler=None, schd_batch_update=False):
+def train_one_epoch(epoch, model, swa_model, swa_start, loss_fn, optimizer, train_loader, device, scheduler=None, schd_batch_update=False):
     model.train()
 
     t = time.time()
@@ -215,11 +218,16 @@ def train_one_epoch(epoch, model, loss_fn, optimizer, train_loader, device, sche
                 description = f'epoch {epoch} loss: {running_loss:.4f}'
                 
                 pbar.set_description(description)
-                
-    if scheduler is not None and not schd_batch_update:
+
+    if epoch > swa_start:
+        swa_model.update_parameters(model)
+        swa_scheduler.step()
+        torch.optim.swa_utils.update_bn(train_loader, swa_model, device=device)     
+    elif scheduler is not None and not schd_batch_update:
         scheduler.step()
+    
         
-def valid_one_epoch(fold, epoch, model, loss_fn, val_loader, device, scheduler=None, schd_loss_update=False):
+def valid_one_epoch(fold, epoch, model, swa_model, swa_start, loss_fn, val_loader, device, scheduler=None, schd_loss_update=False):
     global max_acc, min_loss
 
     model.eval()
@@ -235,8 +243,11 @@ def valid_one_epoch(fold, epoch, model, loss_fn, val_loader, device, scheduler=N
     for step, (imgs, image_labels) in pbar:
         imgs = imgs.to(device).float()
         image_labels = image_labels.to(device).long()
-        
-        image_preds = model(imgs)   #output = model(input)
+        if epoch < swa_start:
+            image_preds = model(imgs)   #output = model(input)
+        else:
+            swa_model.eval()
+            image_preds = swa_model(imgs)
         #print(image_preds.shape, exam_pred.shape)
         image_preds_all += [torch.argmax(image_preds, 1).detach().cpu().numpy()]
         image_targets_all += [image_labels.detach().cpu().numpy()]
@@ -257,22 +268,30 @@ def valid_one_epoch(fold, epoch, model, loss_fn, val_loader, device, scheduler=N
     acc = (image_preds_all==image_targets_all).mean()
     if loss_sum < min_loss:
         min_loss = loss_sum
-        fitlog.add_best_metric({'loss': min_loss})
-        fitlog.add_best_metric({'loss_epoch': epoch})
-    if acc > max_acc:
-        max_acc = acc
-        fitlog.add_best_metric({'acc': max_acc})
-        fitlog.add_best_metric({'acc_epoch': epoch})
-        torch.save(model.state_dict(),'{}/{}_fold_{}_best'.format(save_dir, args.model, fold))
+        # fitlog.add_best_metric({'loss': min_loss})
+        # fitlog.add_best_metric({'loss_epoch': epoch})
+        print('validation multi-class accuracy = {:.4f}'.format((image_preds_all==image_targets_all).mean()))
 
-    print('validation multi-class accuracy = {:.4f}'.format((image_preds_all==image_targets_all).mean()))
+    if epoch < swa_start:
+        if acc > max_acc:
+            max_acc = acc
+            # fitlog.add_best_metric({'acc': max_acc})
+            # fitlog.add_best_metric({'acc_epoch': epoch})
+            torch.save(model.state_dict(),'{}/{}_fold_{}_best'.format(save_dir, args.model, fold))
+            print('validation multi-class accuracy = {:.4f}'.format((image_preds_all==image_targets_all).mean()))
+    else:
+        if acc > max_acc:
+            max_acc = acc
+            torch.save(model.state_dict(),'{}/swa_{}_fold_{}_best'.format(save_dir, args.model, fold))
+            print('swa validation multi-class accuracy = {:.4f}'.format((image_preds_all==image_targets_all).mean()))
+
+    
     
     if scheduler is not None:
         if schd_loss_update:
             scheduler.step(loss_sum/sample_num)
         else:
             scheduler.step()
-
 
 class CassavaDataset(Dataset):
     def __init__(self, df, data_root, 
@@ -321,63 +340,12 @@ class CassavaDataset(Dataset):
         # get labels
         if self.output_label:
             target = self.labels[index]
-          
+        
         img  = get_img("{}/{}".format(self.data_root, self.df.loc[index]['image_id']))
 
         if self.transforms:
             img = self.transforms(image=img)['image']
-        
-        if self.do_fmix and np.random.uniform(0., 1., size=1)[0] > 0.5:
-            with torch.no_grad():
-                #lam, mask = sample_mask(**self.fmix_params)
-                
-                lam = np.clip(np.random.beta(self.fmix_params['alpha'], self.fmix_params['alpha']),0.6,0.7)
-                
-                # Make mask, get mean / std
-                mask = make_low_freq_image(self.fmix_params['decay_power'], self.fmix_params['shape'])
-                mask = binarise_mask(mask, lam, self.fmix_params['shape'], self.fmix_params['max_soft'])
-    
-                fmix_ix = np.random.choice(self.df.index, size=1)[0]
-                fmix_img  = get_img("{}/{}".format(self.data_root, self.df.iloc[fmix_ix]['image_id']))
-
-                if self.transforms:
-                    fmix_img = self.transforms(image=fmix_img)['image']
-
-                mask_torch = torch.from_numpy(mask)
-                
-                # mix image
-                img = mask_torch*img+(1.-mask_torch)*fmix_img
-
-                #print(mask.shape)
-
-                #assert self.output_label==True and self.one_hot_label==True
-
-                # mix target
-                rate = mask.sum()/args.img_size/args.img_size
-                target = rate*target + (1.-rate)*self.labels[fmix_ix]
-                #print(target, mask, img)
-                #assert False
-        
-        if self.do_cutmix and np.random.uniform(0., 1., size=1)[0] > 0.5:
-            #print(img.sum(), img.shape)
-            with torch.no_grad():
-                cmix_ix = np.random.choice(self.df.index, size=1)[0]
-                cmix_img  = get_img("{}/{}".format(self.data_root, self.df.iloc[cmix_ix]['image_id']))
-                if self.transforms:
-                    cmix_img = self.transforms(image=cmix_img)['image']
-                    
-                lam = np.clip(np.random.beta(self.cutmix_params['alpha'], self.cutmix_params['alpha']),0.3,0.4)
-                bbx1, bby1, bbx2, bby2 = rand_bbox((args.img_size, args.img_size), lam)
-
-                img[:, bbx1:bbx2, bby1:bby2] = cmix_img[:, bbx1:bbx2, bby1:bby2]
-
-                rate = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (args.img_size * args.img_size))
-                target = rate*target + (1.-rate)*self.labels[cmix_ix]
-                
-            #print('-', img.sum())
-            #print(target)
-            #assert False
-                            
+                         
         # do label smoothing
         #print(type(img), type(target))
         if self.output_label == True:
@@ -390,8 +358,16 @@ class CassvaImgClassifier(nn.Module):
     def __init__(self, model_arch, n_class, pretrained=False):
         super().__init__()
         self.model = timm.create_model(model_arch, pretrained=pretrained)
-        n_features = self.model.classifier.in_features
-        self.model.classifier = nn.Linear(n_features, n_class)
+        if model_arch[:2] == 'tf':
+            num_ftrs = self.model.classifier.in_features
+            self.model.classifier = nn.Linear(num_ftrs, n_class)
+        elif model_arch[:3] == 'vit':
+            num_ftrs = self.model.head.in_features
+            self.model.head = nn.Linear(num_ftrs, n_class)
+        else:
+            num_ftrs = self.model.fc.in_features
+            self.model.fc = nn.Linear(num_ftrs, n_class)
+        #
         '''
         self.model.classifier = nn.Sequential(
             nn.Dropout(0.3),
@@ -399,7 +375,9 @@ class CassvaImgClassifier(nn.Module):
             nn.Linear(n_features, n_class, bias=True)
         )
         '''
+    @autocast()
     def forward(self, x):
+        #with autocast():
         x = self.model(x)
         return x
 
@@ -424,43 +402,52 @@ if __name__ == '__main__':
         print('Training with {} started'.format(fold))
 
         print(len(trn_idx), len(val_idx))
-        train_loader, val_loader = prepare_dataloader(train, trn_idx, val_idx, data_root='../cassava/cassava-leaf-disease-classification/train_images/')
+        train_loader, val_loader = prepare_dataloader(train, trn_idx, val_idx)
 
-        device = torch.device('cuda:0')
+        device = torch.device('cuda')
         
-        if args.model == 'vit':
-            model = VisionTransformer.from_pretrained('ViT-B_16', num_classes=5).to(device)
-        else:
-            model = CassvaImgClassifier(args.model, train.label.nunique(), pretrained=True).to(device)
+        model = CassvaImgClassifier(args.model, train.label.nunique(), pretrained=True).to(device)
+        swa_model = AveragedModel(model).to(device)
+        
+        model= torch.nn.DataParallel(model)
+        
         scaler = GradScaler()   
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        #scheduler = torch.optim.lr_scheduler.StepLR(optimizer, gamma=0.1, step_size=args.epochs-1)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=args.t0, T_mult=1, eta_min=args.min_lr, last_epoch=-1)
-        #scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer=optimizer, pct_start=0.1, div_factor=25, 
-        #                                                max_lr=args.lr, epochs=args.epochs, steps_per_epoch=len(train_loader))
+
+        if 'vit' in args.model:
+            optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.001)
+            # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.1)        
+        else:
+            #optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+            optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+            #scheduler = torch.optim.lr_scheduler.StepLR(optimizer, gamma=0.1, step_size=2)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=3, T_mult=2, eta_min=args.min_lr, last_epoch=-1)
+            #scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer=optimizer, pct_start=0.1, div_factor=25, 
+            #                                                max_lr=args.lr, epochs=args.epochs, steps_per_epoch=len(train_loader))
         
+        swa_scheduler = SWALR(optimizer, swa_lr=args.swa_lr)
+
         if args.smooth_ratio > 0.:
             criterion = BiTemperedLoss(t1=args.t1, t2=args.t2, label_smoothing=args.smooth_ratio).to(device)
         else:
             criterion = nn.CrossEntropyLoss().to(device) 
 
-        if args.model == 'vit':
-            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.001)
-            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.1)        
 
+
+        
         for epoch in range(args.epochs):
-            train_one_epoch(epoch, model, criterion, optimizer, train_loader, device, scheduler=scheduler, schd_batch_update=False)
-
+            train_one_epoch(epoch, model, swa_model, args.swa_start, criterion, optimizer, train_loader, device, scheduler=scheduler, schd_batch_update=False)
+             
             with torch.no_grad():
-                valid_one_epoch(fold, epoch, model, criterion, val_loader, device, scheduler=None, schd_loss_update=False)
+                valid_one_epoch(fold, epoch, model, swa_model, args.swa_start, criterion, val_loader, device, scheduler=None, schd_loss_update=False)
 
             torch.save(model.state_dict(),'{}/{}_fold_{}_last'.format(save_dir, args.model, fold))
-            
+       
+        
         del model, optimizer, train_loader, val_loader, scaler, scheduler
         torch.cuda.empty_cache()
         acc.append(max_acc)
 
     if len(acc) > 1:
         nfold = len(acc)
-        fitlog.add_best_metric({str(nfold) + 'fold' : np.mean(acc)})
-    fitlog.finish()
+        # fitlog.add_best_metric({str(nfold) + 'fold' : np.mean(acc)})
+    # fitlog.finish()
