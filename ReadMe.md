@@ -17,5 +17,5 @@ ln -s {源数据集路径} cassava
 
 # 训练
 ``
-python train.py --model swsl_resnext101_32x8d --batch-size 8 --gpu 0,1 
+python train.py --model swsl_resnext101_32x8d 
 ``
